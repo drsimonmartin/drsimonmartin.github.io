@@ -1,0 +1,2004 @@
+<!DOCTYPE html>
+<!-- version 17 from 2026-03-31 
+see the github repository for details of updates -->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Score Viewer</title>
+
+  <!--
+    ═══════════════════════════════════════════════════════════════
+    EXTERNAL DEPENDENCIES
+    ═══════════════════════════════════════════════════════════════
+    OpenSheetMusicDisplay (OSMD): the only mature, actively-maintained
+    MusicXML renderer that runs entirely in the browser. It uses
+    VexFlow under the hood to draw notation onto an HTML5 canvas/SVG.
+
+    We load it from the jsDelivr CDN. No build step required.
+    ═══════════════════════════════════════════════════════════════
+  -->
+  <script src="https://cdn.jsdelivr.net/npm/opensheetmusicdisplay@1.8.6/build/opensheetmusicdisplay.min.js"></script>
+
+  <!-- fflate: pure-JS ZIP decompressor used to unpack .mxl files.
+       The browser DecompressionStream API handles raw gzip/deflate streams
+       but NOT the ZIP container format, so we need a proper ZIP library. -->
+  <script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
+
+  <!--
+    Google Fonts: 'Playfair Display' for headings (elegant serif, musical
+    connotation), 'Source Code Pro' for measure-number inputs (monospace
+    clarity), 'Lato' for body text (clean, legible).
+  -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,700;1,400&family=Source+Code+Pro:wght@400;600&family=Lato:wght@300;400;700&display=swap" rel="stylesheet" />
+
+  <style>
+    /*
+     ═══════════════════════════════════════════════════════════════
+     CSS CUSTOM PROPERTIES (DESIGN TOKENS)
+     ═══════════════════════════════════════════════════════════════
+     Centralising colours and spacing here means a single edit
+     propagates everywhere. The palette is inspired by aged music
+     manuscript paper: warm cream, deep ink, rust accent.
+     ═══════════════════════════════════════════════════════════════
+    */
+    :root {
+      --cream:       #f5f0e8;       /* page/background */
+      --parchment:   #ede5d0;       /* panel surfaces  */
+      --ink:         #1a1612;       /* primary text    */
+      --ink-mid:     #4a3f35;       /* secondary text  */
+      --ink-faint:   #9e8e7e;       /* placeholders    */
+      --rust:        #b84c1e;       /* accent / CTA    */
+      --rust-dark:   #8a3614;       /* hover state     */
+      --line:        #c8baa8;       /* borders         */
+      --shadow:      rgba(26,22,18,0.15);
+
+      --font-head:   'Playfair Display', Georgia, serif;
+      --font-body:   'Lato', sans-serif;
+      --font-mono:   'Source Code Pro', monospace;
+
+      --radius:      6px;
+      --transition:  0.2s ease;
+    }
+
+    /* ── RESET & BASE ─────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--cream);
+      color: var(--ink);
+      font-family: var(--font-body);
+      font-size: 15px;
+      line-height: 1.6;
+      /*
+        height (not min-height) fixes the body to exactly the viewport.
+        overflow:hidden prevents the page itself from scrolling — all
+        scrolling happens inside #panel and #score-container independently,
+        so the header, controls, and status bar stay fixed on screen.
+      */
+      height: 100vh;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── HEADER ───────────────────────────────────────────────── */
+    header {
+      background: var(--ink);
+      color: var(--cream);
+      padding: 18px 32px;
+      display: flex;
+      align-items: baseline;
+      gap: 16px;
+      border-bottom: 3px solid var(--rust);
+    }
+
+    header h1 {
+      font-family: var(--font-head);
+      font-size: 1.7rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+
+    header .subtitle {
+      font-size: 0.82rem;
+      color: var(--ink-faint);
+      font-weight: 300;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    /* ── MAIN LAYOUT ──────────────────────────────────────────── */
+    main {
+      flex: 1;
+      /*
+        min-height:0 is essential for flex children. Without it, a flex
+        item's minimum height defaults to the size of its content, which
+        overrides the parent's constraint and causes the whole page to
+        grow. With min-height:0, <main> is properly capped at the height
+        body allocates it (viewport minus header and status bar).
+        overflow:hidden here prevents main itself from scrolling; each
+        column manages its own scroll independently.
+      */
+      min-height: 0;
+      overflow: hidden;
+      display: grid;
+      grid-template-columns: 280px 1fr;
+      grid-template-rows: 1fr;
+      gap: 0;
+    }
+
+    /* ── CONTROL PANEL ────────────────────────────────────────── */
+    #panel {
+      background: var(--parchment);
+      border-right: 1px solid var(--line);
+      padding: 24px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+      overflow-y: auto;
+    }
+
+    .panel-section {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .panel-section h2 {
+      font-family: var(--font-head);
+      font-size: 0.78rem;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--rust);
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 6px;
+    }
+
+    /* ── FILE DROP ZONE ───────────────────────────────────────── */
+    /*
+      The drop zone accepts both drag-and-drop and click-to-browse.
+      Visual feedback is provided via the .drag-over class toggled
+      in JavaScript dragenter/dragleave handlers.
+    */
+    #drop-zone {
+      border: 2px dashed var(--line);
+      border-radius: var(--radius);
+      padding: 24px 12px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color var(--transition), background var(--transition);
+      position: relative;        /* for the hidden <input> overlay */
+    }
+
+    #drop-zone:hover,
+    #drop-zone.drag-over {
+      border-color: var(--rust);
+      background: rgba(184,76,30,0.05);
+    }
+
+    #drop-zone .drop-icon {
+      font-size: 2rem;
+      display: block;
+      margin-bottom: 8px;
+      opacity: 0.5;
+    }
+
+    #drop-zone p {
+      font-size: 0.82rem;
+      color: var(--ink-mid);
+      line-height: 1.4;
+    }
+
+    #drop-zone p strong { color: var(--rust); }
+
+    /* Hidden file input sits on top of the drop zone */
+    #file-input {
+      position: absolute;
+      inset: 0;
+      opacity: 0;
+      cursor: pointer;
+      width: 100%;
+      height: 100%;
+    }
+
+    /* ── LOADED FILE NAME TAG ─────────────────────────────────── */
+    #file-tag {
+      display: none;           /* shown via JS once a file is loaded */
+      align-items: center;
+      gap: 8px;
+      background: var(--ink);
+      color: var(--cream);
+      border-radius: var(--radius);
+      padding: 6px 10px;
+      font-size: 0.78rem;
+      font-family: var(--font-mono);
+      word-break: break-all;
+    }
+
+    #file-tag .tag-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--rust);
+      flex-shrink: 0;
+    }
+
+    /* ── GENERIC FORM ELEMENTS ────────────────────────────────── */
+    label {
+      font-size: 0.8rem;
+      font-weight: 700;
+      color: var(--ink-mid);
+      letter-spacing: 0.04em;
+    }
+
+    input[type="number"],
+    select {
+      width: 100%;
+      padding: 7px 10px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--cream);
+      color: var(--ink);
+      font-family: var(--font-mono);
+      font-size: 0.9rem;
+      transition: border-color var(--transition);
+      appearance: none;
+    }
+
+    input[type="number"]:focus,
+    select:focus {
+      outline: none;
+      border-color: var(--rust);
+    }
+
+    /* Pair of side-by-side inputs (bar-from / bar-to) */
+    .range-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    .range-row > div { display: flex; flex-direction: column; gap: 4px; }
+
+    /* ── BUTTONS ──────────────────────────────────────────────── */
+    .btn {
+      padding: 9px 16px;
+      border: none;
+      border-radius: var(--radius);
+      font-family: var(--font-body);
+      font-weight: 700;
+      font-size: 0.85rem;
+      cursor: pointer;
+      transition: background var(--transition), transform 0.1s;
+      letter-spacing: 0.04em;
+    }
+
+    .btn:active { transform: scale(0.97); }
+
+    .btn-primary {
+      background: var(--rust);
+      color: #fff;
+      width: 100%;
+    }
+
+    .btn-primary:hover { background: var(--rust-dark); }
+
+    .btn-primary:disabled {
+      background: var(--line);
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    .btn-ghost {
+      background: transparent;
+      color: var(--ink-mid);
+      border: 1px solid var(--line);
+    }
+
+    .btn-ghost:hover {
+      border-color: var(--rust);
+      color: var(--rust);
+    }
+
+    /* ── PAGE NAVIGATION ROW ──────────────────────────────────── */
+    .page-nav {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .page-nav .btn { flex-shrink: 0; padding: 7px 14px; }
+
+    #page-indicator {
+      flex: 1;
+      text-align: center;
+      font-family: var(--font-mono);
+      font-size: 0.78rem;
+      color: var(--ink-mid);
+    }
+
+    /* ── MODE TABS ────────────────────────────────────────────── */
+    /*
+      Two viewing modes: "Page" (OSMD's built-in pagination) and
+      "Bar Range" (filter to specific measure numbers).
+      A tab strip toggles between them.
+    */
+    .tab-strip {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+
+    .tab-btn {
+      padding: 8px;
+      background: var(--cream);
+      border: none;
+      cursor: pointer;
+      font-family: var(--font-body);
+      font-size: 0.8rem;
+      font-weight: 700;
+      color: var(--ink-mid);
+      letter-spacing: 0.04em;
+      transition: background var(--transition), color var(--transition);
+    }
+
+    .tab-btn.active {
+      background: var(--rust);
+      color: #fff;
+    }
+
+    /* Panels for each tab's controls */
+    .tab-panel { display: none; flex-direction: column; gap: 10px; }
+    .tab-panel.active { display: flex; }
+
+    /* ── SCORE VIEWPORT ───────────────────────────────────────── */
+    #score-area {
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ── PLACEHOLDER / EMPTY STATE ────────────────────────────── */
+    /*
+      Shown before any file is loaded. Sits as a flex child of
+      #score-area, occupying the full space.
+    */
+    #empty-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      gap: 16px;
+      color: var(--ink-faint);
+      text-align: center;
+      padding: 40px;
+    }
+
+    #empty-state .empty-icon {
+      font-size: 4rem;
+      opacity: 0.3;
+    }
+
+    #empty-state h3 {
+      font-family: var(--font-head);
+      font-size: 1.4rem;
+      font-weight: 400;
+      font-style: italic;
+      color: var(--ink-mid);
+    }
+
+    #empty-state p {
+      font-size: 0.85rem;
+      max-width: 320px;
+      line-height: 1.6;
+    }
+
+    /* The OSMD score scrolls independently within this container */
+    /*
+      KEY FIX: #score-container is now position:relative so that
+      #loading can be absolutely positioned as an overlay on top of
+      it. We never hide score-container during re-renders — doing so
+      gives OSMD a zero-width viewport, causing it to lay out the
+      score into zero width and produce a blank result.
+    */
+    #score-container {
+      flex: 1;
+      overflow-y: auto;
+      overflow-x: hidden;
+      padding: 32px 40px;
+      background: white;
+      position: relative;      /* establishes containing block for #loading overlay */
+      box-shadow: inset 4px 0 12px -4px var(--shadow);
+      /*
+       Disable scroll anchoring. Browsers use scroll anchoring to adjust
+       scrollTop when DOM content changes, keeping the visible area stable.
+       When OSMD replaces the SVG with a new score this fires and restores
+       the old scroll position, overwriting our reset. Safari is particularly
+       aggressive about this. overflow-anchor: none disables it entirely.
+      */
+      overflow-anchor: none;
+    }
+
+    /* OSMD renders SVG elements inside this div */
+    #osmd-canvas {
+      max-width: 900px;
+      margin: 0 auto;
+    }
+
+    /* ── LOADING SPINNER ──────────────────────────────────────── */
+    /*
+      Now an overlay that sits on top of #score-container rather than
+      replacing it. This means OSMD always renders into a visible,
+      correctly-sized container — it just has a translucent overlay
+      on top while it works.
+
+      For the initial load (before any score is shown) we display the
+      spinner as a normal flex child of #score-area instead, because
+      #score-container is itself hidden at that point — see showLoading().
+    */
+    #loading {
+      display: none;
+      position: absolute;   /* overlay on top of the score content */
+      inset: 0;             /* fill the entire #score-container area */
+      z-index: 10;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      color: var(--ink-mid);
+      /* Semi-transparent white so existing score content is visible beneath */
+      background: rgba(255, 255, 255, 0.75);
+      backdrop-filter: blur(2px);
+    }
+
+    .spinner {
+      width: 36px; height: 36px;
+      border: 3px solid var(--line);
+      border-top-color: var(--rust);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── STATUS BAR ───────────────────────────────────────────── */
+    #status-bar {
+      background: var(--ink);
+      color: var(--cream);
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      padding: 5px 20px;
+      min-height: 26px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    #status-bar .status-dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--ink-faint);
+      flex-shrink: 0;
+    }
+
+    #status-bar .status-dot.ok    { background: #5cb85c; }
+    #status-bar .status-dot.warn  { background: #f0ad4e; }
+    #status-bar .status-dot.error { background: #d9534f; }
+
+    /* ── NOTICE BOXES ─────────────────────────────────────────── */
+    .notice {
+      padding: 10px 12px;
+      border-radius: var(--radius);
+      font-size: 0.8rem;
+      line-height: 1.5;
+    }
+
+    .notice-warn {
+      background: #fff8e6;
+      border-left: 3px solid #f0ad4e;
+      color: #7a5c00;
+    }
+
+    .notice-info {
+      background: #eaf4fb;
+      border-left: 3px solid #5bc0de;
+      color: #1a5a7a;
+    }
+
+    /* ── TOGGLE SWITCH ────────────────────────────────────────────
+      A custom checkbox styled as a sliding pill toggle.
+      The actual <input type="checkbox"> is visually hidden but still
+      accessible — screen readers and keyboard navigation use it normally.
+    ─────────────────────────────────────────────────────────── */
+    .toggle-switch {
+      position: relative;
+      display: inline-block;
+      width: 36px;
+      height: 20px;
+      flex-shrink: 0;
+      cursor: pointer;
+    }
+
+    .toggle-switch input {
+      /* Hide the native checkbox; keep it in the accessibility tree */
+      position: absolute;
+      opacity: 0;
+      width: 0; height: 0;
+    }
+
+    .toggle-track {
+      position: absolute;
+      inset: 0;
+      background: var(--line);
+      border-radius: 20px;
+      transition: background var(--transition);
+    }
+
+    .toggle-switch input:checked + .toggle-track {
+      background: var(--rust);
+    }
+
+    .toggle-thumb {
+      position: absolute;
+      top: 3px; left: 3px;
+      width: 14px; height: 14px;
+      background: white;
+      border-radius: 50%;
+      transition: transform var(--transition);
+      box-shadow: 0 1px 3px var(--shadow);
+    }
+
+    .toggle-switch input:checked + .toggle-track .toggle-thumb {
+      transform: translateX(16px);
+    }
+
+    /* ── RESPONSIVE ───────────────────────────────────────────── */
+    @media (max-width: 700px) {
+      /*
+        On narrow screens the two columns stack vertically.
+        body/main overflow rules still apply, but the panel sizes to
+        its content (auto rows) and the score container takes the rest.
+        The panel's overflow-y reverts to visible so it is not scroll-
+        clipped in this layout — its full height is always shown.
+      */
+      main { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+      #panel { border-right: none; border-bottom: 1px solid var(--line); overflow-y: visible; }
+      #score-container { padding: 16px; }
+    }
+  </style>
+</head>
+
+<body>
+
+  <!-- ═══════════════════════════════════════════════════════════
+       HEADER
+       ═══════════════════════════════════════════════════════════ -->
+  <header>
+    <h1>&#9835; Score Viewer</h1>
+    <span class="subtitle">MusicXML · LilyPond</span>
+  </header>
+
+  <!-- ═══════════════════════════════════════════════════════════
+       MAIN LAYOUT: panel + score area
+       ═══════════════════════════════════════════════════════════ -->
+  <main>
+
+    <!-- ── LEFT PANEL ──────────────────────────────────────────── -->
+    <aside id="panel">
+
+      <!-- SECTION: File loading -->
+      <div class="panel-section">
+        <h2>Open Score</h2>
+
+        <!--
+          Drop zone: the hidden <input type="file"> sits over the
+          entire zone via position:absolute, so clicking anywhere
+          on the zone opens the file browser. Drag events are handled
+          separately on the div itself.
+        -->
+        <div id="drop-zone" role="button" aria-label="Drop or click to open a score file">
+          <input type="file" id="file-input" accept=".xml,.musicxml,.mxl,.ly,.ily" aria-label="Choose file" />
+          <span class="drop-icon">🎼</span>
+          <p>
+            <strong>Drop a file here</strong><br />
+            or click to browse<br />
+            <br />
+            <em>.xml · .musicxml · .mxl<br />.ly · .ily</em>
+          </p>
+        </div>
+
+        <!-- Shown after a file is loaded; displays the filename -->
+        <div id="file-tag">
+          <span class="tag-dot"></span>
+          <span id="file-tag-name">—</span>
+        </div>
+      </div>
+
+      <!-- SECTION: View mode tabs -->
+      <div class="panel-section" id="controls-section" style="display:none">
+        <h2>View Mode</h2>
+
+        <!--
+          Two mutually exclusive modes:
+          1. PAGE mode  – shows one OSMD-rendered page at a time
+          2. RANGE mode – renders only the measures between two user-
+                          specified bar numbers
+        -->
+        <div class="tab-strip" role="tablist">
+          <button class="tab-btn active" id="tab-page"  role="tab" aria-selected="true"  onclick="switchTab('page')">Page</button>
+          <button class="tab-btn"        id="tab-range" role="tab" aria-selected="false" onclick="switchTab('range')">Bar Range</button>
+        </div>
+
+        <!-- PAGE MODE CONTROLS -->
+        <div class="tab-panel active" id="panel-page">
+          <div class="page-nav">
+            <button class="btn btn-ghost" id="btn-prev" onclick="changePage(-1)" title="Previous page">&#8592;</button>
+            <span id="page-indicator">Page — / —</span>
+            <button class="btn btn-ghost" id="btn-next" onclick="changePage(+1)" title="Next page">&#8594;</button>
+          </div>
+
+          <!-- Jump to a specific page number -->
+          <div style="display:flex; gap:8px; align-items:flex-end">
+            <div style="flex:1; display:flex; flex-direction:column; gap:4px">
+              <label for="input-goto-page">Go to page</label>
+              <input type="number" id="input-goto-page" min="1" placeholder="1" />
+            </div>
+            <button class="btn btn-primary" style="width:auto; padding:7px 14px" onclick="gotoPage()">Go</button>
+          </div>
+        </div>
+
+        <!-- BAR RANGE MODE CONTROLS -->
+        <div class="tab-panel" id="panel-range">
+
+          <!-- Score metadata: shown after load so the user knows the valid range -->
+          <div class="notice notice-info" id="range-hint" style="display:none">
+            Score has <strong id="total-measures-label">—</strong> measures.
+          </div>
+
+          <div class="range-row">
+            <div>
+              <label for="input-bar-from">From bar</label>
+              <input type="number" id="input-bar-from" min="0" value="1" />
+            </div>
+            <div>
+              <label for="input-bar-to">To bar</label>
+              <input type="number" id="input-bar-to" min="1" value="8" />
+            </div>
+          </div>
+
+          <button class="btn btn-primary" id="btn-render-range" onclick="renderRange()" disabled>
+            Render Range
+          </button>
+
+          <!--
+            Quick-jump buttons: useful for stepping through the score
+            in fixed-size windows (e.g. 8 bars at a time).
+          -->
+          <div style="display:flex; gap:8px">
+            <button class="btn btn-ghost" style="flex:1" onclick="shiftRange(-1)">&#8592; Prev chunk</button>
+            <button class="btn btn-ghost" style="flex:1" onclick="shiftRange(+1)">Next chunk &#8594;</button>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- SECTION: Display options (zoom, part names, instrument filter) -->
+      <div class="panel-section" id="zoom-section" style="display:none">
+        <h2>Display</h2>
+
+        <!-- Zoom slider -->
+        <label for="input-zoom">Zoom: <span id="zoom-label">1.0×</span></label>
+        <input type="range" id="input-zoom" min="0.5" max="2.0" step="0.1" value="1.0"
+               style="width:100%; accent-color: var(--rust)"
+               oninput="updateZoom(this.value)" />
+
+        <!--
+          Part names toggle.
+          OSMD's drawPartNames option suppresses the instrument label
+          printed to the left of each system brace. This is a simple
+          boolean re-render — no reload required.
+        -->
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:4px">
+          <label for="toggle-part-names" style="margin:0">Show stave names</label>
+          <label class="toggle-switch" title="Show or hide instrument name labels">
+            <input type="checkbox" id="toggle-part-names" checked onchange="togglePartNames(this.checked)" />
+            <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          </label>
+        </div>
+
+        <!--
+          Instrument selector.
+          Populated dynamically after a score is loaded. Shows 'All instruments'
+          plus one entry per part. Selecting a part sets all other parts'
+          .Visible property to false before re-rendering.
+          Hidden until a score with >1 part is loaded.
+        -->
+        <div id="instrument-select-row" style="display:none; flex-direction:column; gap:4px">
+          <label for="select-instrument">Instrument</label>
+          <select id="select-instrument" onchange="selectInstrument(this.value)">
+            <option value="-1">All instruments</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- SECTION: LilyPond notice -->
+      <div class="panel-section" id="lilypond-notice" style="display:none">
+        <h2>LilyPond</h2>
+        <div class="notice notice-warn">
+          <strong>Server-side compilation required.</strong><br />
+          LilyPond (<code>.ly</code>) files must be compiled by the
+          LilyPond binary (a native C++ program) — this cannot run
+          inside a browser. <br /><br />
+          Options:
+          <ol style="margin: 6px 0 0 16px; line-height:1.8">
+            <li>Convert to MusicXML first using
+              <a href="https://www.musicxml.com/tutorial/converting/" target="_blank" rel="noopener" style="color:var(--rust)">musicxml-tools</a>
+              or LilyPond's own <code>--backend=musicxml</code> flag (≥ v2.24)</li>
+            <li>Use the
+              <a href="https://lilypond.org/web/use/" target="_blank" rel="noopener" style="color:var(--rust)">online LilyPond compiler</a>,
+              save the resulting PDF/SVG, then reload here</li>
+          </ol>
+        </div>
+        <button class="btn btn-primary" onclick="dismissLilypondNotice()">
+          Load a MusicXML file instead
+        </button>
+      </div>
+
+    </aside>
+
+    <!-- ── SCORE AREA ─────────────────────────────────────────── -->
+    <section id="score-area">
+
+      <!-- Empty state: visible before any file is loaded -->
+      <div id="empty-state">
+        <span class="empty-icon">𝄞</span>
+        <h3>Open a score to begin</h3>
+        <p>
+          Supports standard MusicXML (<code>.xml</code>, <code>.musicxml</code>,
+          compressed <code>.mxl</code>) and LilyPond (<code>.ly</code>, <code>.ily</code>) files.
+        </p>
+      </div>
+
+      <!--
+        score-container is ALWAYS visible once a score is loaded.
+        It must never be hidden during re-renders — OSMD measures
+        the container's width to lay out the score, so hiding it
+        causes OSMD to render into zero width, producing a blank result.
+
+        #loading sits inside here as an absolutely-positioned overlay,
+        so the container (and its width) remain intact while OSMD renders.
+      -->
+      <div id="score-container" style="display:none">
+
+        <!-- Loading overlay: shown during render, sits on top of score -->
+        <div id="loading">
+          <div class="spinner"></div>
+          <span>Rendering score…</span>
+        </div>
+
+        <!-- OSMD appends SVG elements as children of this div -->
+        <div id="osmd-canvas"></div>
+      </div>
+
+    </section>
+
+  </main>
+
+  <!-- ── STATUS BAR ─────────────────────────────────────────────── -->
+  <div id="status-bar">
+    <span class="status-dot" id="status-dot"></span>
+    <span id="status-text">No file loaded</span>
+  </div>
+
+
+  <!-- ═══════════════════════════════════════════════════════════
+       JAVASCRIPT
+       ═══════════════════════════════════════════════════════════ -->
+  <script>
+    /*
+     ═══════════════════════════════════════════════════════════════
+     APP STATE
+     ═══════════════════════════════════════════════════════════════
+     All mutable application state lives here as plain variables.
+     This avoids framework overhead for what is essentially a
+     single-page utility app.
+     ═══════════════════════════════════════════════════════════════
+    */
+    let osmd          = null;   // OpenSheetMusicDisplay instance
+    let currentPage   = 1;      // 1-indexed page in PAGE mode
+    let totalPages    = 0;      // total pages after rendering
+    let totalMeasures   = 0;      // number of full bars (anacrusis excluded)
+    let anacrusisOffset = 0;      // 1 if score opens with an implicit pickup bar, else 0
+    let minBar          = 1;      // lowest bar number the user may enter (0 if anacrusis exists, else 1)
+    let currentMode   = 'page'; // 'page' | 'range'
+    let currentZoom   = 1.0;    // zoom multiplier
+    let scoreXmlText    = null;   // raw MusicXML string (kept for re-rendering)
+    let showPartNames   = true;   // whether to render instrument/part name labels
+    let selectedPartIdx = -1;     // -1 = all parts; ≥0 = index into Sheet.Instruments
+
+    /*
+     ─────────────────────────────────────────────────────────────
+     OSMD INITIALISATION
+     ─────────────────────────────────────────────────────────────
+     We create the OSMD instance once and reuse it.
+     drawingParameters: 'compact' reduces margins for a tighter
+     on-screen look compared to print output.
+    */
+    function initOSMD() {
+      osmd = new opensheetmusicdisplay.OpenSheetMusicDisplay('osmd-canvas', {
+        backend:            'svg',          // SVG backend scales better than canvas
+        drawingParameters:  'compact',
+        followCursor:       false,
+        /*
+         autoResize MUST be false. When true, OSMD attaches a ResizeObserver
+         to the canvas container. Making score-container visible triggers a
+         resize event (element gains real dimensions), which causes OSMD to
+         re-render internally — after our scrollTop = 0 — resetting the
+         scroll position. We manage all re-renders ourselves, so autoResize
+         is not needed. Window resize is handled separately below.
+        */
+        autoResize:         false,
+        pageFormat:         'Endless',      // default; overridden per mode
+        drawTitle:          true,
+        drawSubtitle:       true,
+        drawComposer:       true,
+      });
+    }
+
+    /*
+     ─────────────────────────────────────────────────────────────
+     STATUS BAR HELPERS
+     Sets the dot colour and message text in the bottom status bar.
+     ─────────────────────────────────────────────────────────────
+    */
+    function setStatus(msg, type = 'ok') {
+      document.getElementById('status-text').textContent = msg;
+      const dot = document.getElementById('status-dot');
+      dot.className = 'status-dot ' + type;  // 'ok' | 'warn' | 'error'
+    }
+
+    /*
+     ─────────────────────────────────────────────────────────────
+     UI VISIBILITY HELPERS
+     Centralised show/hide so we don't scatter style mutations.
+     ─────────────────────────────────────────────────────────────
+    */
+    function showScoreView() {
+      /*
+       Hide the empty state (pre-load placeholder) and the loading
+       overlay, then ensure the score container is visible.
+       score-container stays visible between renders — we only ever
+       hide it to show the empty state before any score is loaded.
+      */
+      document.getElementById('empty-state').style.display     = 'none';
+      document.getElementById('loading').style.display         = 'none';
+      document.getElementById('score-container').style.display = 'block';
+    }
+
+    function showLoading(resetScrollPos = false) {
+      /*
+       Two cases:
+       A) No score loaded yet (initial file open):
+          score-container is hidden; show it now so OSMD has a
+          correctly-sized container to render into. The loading
+          overlay covers the (as-yet empty) osmd-canvas.
+       B) Re-render of an existing score (range change, zoom, etc.):
+          score-container is already visible. Just show the overlay.
+          OSMD renders into the visible container — correct dimensions
+          are maintained throughout, so the output is not blank.
+
+       In both cases we just ensure score-container is visible and
+       the overlay is shown. The empty-state is always hidden.
+
+       When resetScrollPos is true (new file load) we reset scrollTop
+       here — the earliest possible moment, before OSMD touches the DOM
+       and before any browser scroll-anchoring logic can fire. We also
+       keep the resetScroll() call at the end of onScoreLoaded() as a
+       belt-and-braces measure.
+      */
+      document.getElementById('empty-state').style.display     = 'none';
+      document.getElementById('score-container').style.display = 'block';
+      document.getElementById('loading').style.display         = 'flex';
+      if (resetScrollPos) {
+        document.getElementById('score-container').scrollTop = 0;
+      }
+    }
+
+    function showEmpty() {
+      /*
+       Only reached on load failure or before any file is opened.
+       This is the one case where we DO hide score-container, since
+       there is no score to preserve.
+      */
+      document.getElementById('empty-state').style.display     = 'flex';
+      document.getElementById('score-container').style.display = 'none';
+      document.getElementById('loading').style.display         = 'none';
+    }
+
+    /*
+     ─────────────────────────────────────────────────────────────
+     RESET SCROLL
+     Scrolls score-container back to the top. The assignment is
+     wrapped in requestAnimationFrame so it runs after the browser
+     has committed any pending layout changes (e.g. a display:none
+     → display:block transition). Without this, Safari may silently
+     discard a scrollTop = 0 that runs before layout is finalised,
+     leaving the viewport wherever the previous score had scrolled.
+     ─────────────────────────────────────────────────────────────
+    */
+    function resetScroll() {
+      /*
+       Two nested requestAnimationFrame calls are used deliberately.
+       The first RAF fires before the next paint but layout may not yet
+       be fully committed in Safari after a display:none → display:block
+       transition. The second RAF fires in the following frame, by which
+       point layout is guaranteed to be stable in all browsers.
+
+       We also set scrollTop synchronously before the RAFs as a belt-and-
+       braces measure — if the container happens to already be laid out
+       (e.g. on a re-render where it was already visible) this catches it
+       immediately without waiting.
+      */
+      const container = document.getElementById('score-container');
+      container.scrollTop = 0;
+      requestAnimationFrame(() => {
+        container.scrollTop = 0;
+        requestAnimationFrame(() => {
+          container.scrollTop = 0;
+        });
+      });
+    }
+
+    /*
+     ─────────────────────────────────────────────────────────────
+     FILE INPUT WIRING
+     Both drag-and-drop and click-to-browse funnel into handleFile().
+     ─────────────────────────────────────────────────────────────
+    */
+    const dropZone  = document.getElementById('drop-zone');
+    const fileInput = document.getElementById('file-input');
+
+    /* Drag-enter: highlight the drop zone */
+    dropZone.addEventListener('dragenter', (e) => {
+      e.preventDefault();
+      dropZone.classList.add('drag-over');
+    });
+
+    /* Drag-over: must preventDefault to allow drop */
+    dropZone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+    });
+
+    /* Drag-leave: remove highlight when cursor leaves zone */
+    dropZone.addEventListener('dragleave', () => {
+      dropZone.classList.remove('drag-over');
+    });
+
+    /* Drop: extract file from the DataTransfer object */
+    dropZone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropZone.classList.remove('drag-over');
+      const file = e.dataTransfer.files[0];
+      if (file) handleFile(file);
+    });
+
+    /* Click-to-browse: file input change event */
+    fileInput.addEventListener('change', () => {
+      if (fileInput.files[0]) handleFile(fileInput.files[0]);
+    });
+
+    /*
+     ─────────────────────────────────────────────────────────────
+     HANDLE FILE
+     Dispatches to the appropriate loader based on file extension.
+     ─────────────────────────────────────────────────────────────
+    */
+    function handleFile(file) {
+      const name = file.name.toLowerCase();
+
+      /*
+       Reset the file input value immediately. The 'change' event only
+       fires when the selected file differs from the input's current value.
+       In Safari this means loading file A, then file B, then file A again
+       silently fails — the third selection matches the stored value from
+       the first load. Clearing it here ensures every selection fires.
+      */
+      fileInput.value = '';
+
+      /* Update the file tag in the panel */
+      document.getElementById('file-tag-name').textContent = file.name;
+      document.getElementById('file-tag').style.display = 'flex';
+
+      if (name.endsWith('.ly') || name.endsWith('.ily')) {
+        /*
+         LilyPond files cannot be compiled in the browser (the lilypond
+         binary is a ~50 MB native C++ application). We inform the user
+         and show a helpful set of alternatives instead of silently failing.
+        */
+        handleLilypondFile(file);
+
+      } else if (name.endsWith('.mxl')) {
+        /*
+         Compressed MusicXML (.mxl) is a ZIP containing the XML.
+         OSMD's loadXML method accepts a URL or raw XML string, not a
+         ZIP, so we need to decompress it first. We use the browser's
+         native DecompressionStream (available in all modern browsers).
+         As a fallback, we try loading it directly as OSMD does handle
+         some .mxl blobs internally.
+        */
+        loadCompressedMXL(file);
+
+      } else {
+        /* Plain MusicXML: read as text and pass to OSMD */
+        const reader = new FileReader();
+        reader.onload = (e) => loadMusicXML(e.target.result, file.name);
+        reader.onerror = () => setStatus('Failed to read file', 'error');
+        reader.readAsText(file);
+      }
+    }
+
+    /*
+     ─────────────────────────────────────────────────────────────
+     LILYPOND FILE HANDLER
+     Shows an explanatory notice and hides the score controls.
+     ─────────────────────────────────────────────────────────────
+    */
+    function handleLilypondFile(file) {
+      showEmpty();
+      document.getElementById('controls-section').style.display = 'none';
+      document.getElementById('zoom-section').style.display     = 'none';
+      document.getElementById('lilypond-notice').style.display  = 'block';
+      setStatus('LilyPond file detected — browser compilation not supported', 'warn');
+    }
+
+    function dismissLilypondNotice() {
+      /* Reset the file input so the user can pick a new file */
+      document.getElementById('lilypond-notice').style.display = 'none';
+      document.getElementById('file-tag').style.display        = 'none';
+      fileInput.value = '';
+      setStatus('Ready — load a MusicXML file', 'ok');
+    }
+
+    /*
+     ─────────────────────────────────────────────────────────────
+     LOAD COMPRESSED MXL
+     .mxl is a ZIP archive whose primary entry is rootfile (usually
+     'META-INF/container.xml' → actual XML filename).
+     We use a <jszip> shim or, failing that, pass the ArrayBuffer
+     directly to OSMD which can handle it natively via its own
+     decompressor.
+     ─────────────────────────────────────────────────────────────
+    */
+    function loadCompressedMXL(file) {
+      showLoading();
+      setStatus('Decompressing .mxl…', 'ok');
+
+      const reader = new FileReader();
+      reader.onerror = () => setStatus('Failed to read .mxl file', 'error');
+
+      reader.onload = async (e) => {
+        try {
+          const zipBytes = new Uint8Array(e.target.result);
+
+          /*
+           fflate.unzipSync() decompresses the entire ZIP synchronously
+           and returns an object keyed by filename → Uint8Array of contents.
+           We use the synchronous variant because our files are small and
+           it keeps the control flow straightforward.
+          */
+          let entries;
+          try {
+            entries = fflate.unzipSync(zipBytes);
+          } catch (zipErr) {
+            setStatus('Not a valid ZIP/MXL archive: ' + zipErr.message, 'error');
+            showEmpty();
+            return;
+          }
+
+          /*
+           ── Step 1: read META-INF/container.xml to find the rootfile ──
+           The MusicXML container spec mandates this file. Its structure is:
+             <container>
+               <rootfiles>
+                 <rootfile full-path="score.xml"
+                           media-type="application/vnd.recordare.musicxml+xml"/>
+               </rootfiles>
+             </container>
+          */
+          let xmlFilename = null;
+
+          const containerBytes = entries['META-INF/container.xml'];
+          if (containerBytes) {
+            const containerText = new TextDecoder().decode(containerBytes);
+            const containerDoc  = new DOMParser().parseFromString(containerText, 'application/xml');
+            const rootfileEl    = containerDoc.querySelector('rootfile');
+            if (rootfileEl) {
+              xmlFilename = rootfileEl.getAttribute('full-path');
+            }
+          }
+
+          /*
+           ── Step 2: fallback — scan entries for any .xml file ──
+           If container.xml is missing or malformed (non-compliant exporters
+           sometimes omit it), look for any .xml entry that is not the
+           container itself.
+          */
+          if (!xmlFilename) {
+            const xmlCandidates = Object.keys(entries).filter(name =>
+              name.endsWith('.xml') && name !== 'META-INF/container.xml'
+            );
+
+            if (xmlCandidates.length === 0) {
+              setStatus('No XML file found inside .mxl archive', 'error');
+              showEmpty();
+              return;
+            }
+
+            /* Prefer root-level entries over those in subdirectories */
+            xmlFilename = xmlCandidates.find(n => !n.includes('/')) || xmlCandidates[0];
+            console.warn('[ScoreViewer] container.xml missing; using fallback:', xmlFilename);
+          }
+
+          /* ── Step 3: decode the XML entry as UTF-8 text ── */
+          const xmlBytes = entries[xmlFilename];
+          if (!xmlBytes) {
+            setStatus(`Entry "${xmlFilename}" not found in archive`, 'error');
+            showEmpty();
+            return;
+          }
+
+          const xmlString = new TextDecoder('utf-8').decode(xmlBytes);
+
+          /*
+           ── Step 4: hand off to the normal text-based loader ──
+           loadMusicXML() runs fragment-repair and renders via OSMD.
+           The extracted string is stored in scoreXmlText so mode-
+           switching re-renders continue to work correctly.
+           NOTE: an earlier version of this code passed a raw Uint8Array
+           to osmd.load(), which does not accept binary data — only a
+           string (URL or XML text) or a DOM Document. That is now fixed.
+          */
+          setStatus(`Extracted "${xmlFilename}" — rendering…`, 'ok');
+          await loadMusicXML(xmlString, file.name);
+
+        } catch (err) {
+          setStatus('Failed to decompress .mxl: ' + err.message, 'error');
+          console.error('[ScoreViewer] .mxl decompression error:', err);
+          showEmpty();
+        }
+      };
+
+      reader.readAsArrayBuffer(file);
+    }
+
+    /*
+     ─────────────────────────────────────────────────────────────
+     DIAGNOSE MUSICXML
+     Inspects raw XML text before handing it to OSMD and returns
+     a detailed problem report. This is the function that was
+     missing — previously any parse error produced only OSMD's
+     opaque internal message with no guidance to the user.
+
+     Returns: { ok: true } if the document looks loadable, or
+              { ok: false, reason: string, fixed: string|null }
+              where `fixed` is a repaired XML string if we can
+              auto-correct the problem, otherwise null.
+     ─────────────────────────────────────────────────────────────
+    */
+    function diagnoseMusicXML(xmlString) {
+      /* ── Step 1: parse as XML and catch well-formedness errors ── */
+      const parser = new DOMParser();
+      const doc    = parser.parseFromString(xmlString, 'application/xml');
+      const parseError = doc.querySelector('parsererror');
+
+      if (parseError) {
+        /*
+         DOMParser signals an XML syntax error by inserting a
+         <parsererror> element. Extract its text for the user.
+        */
+        const msg = parseError.textContent.split('\n')[0].trim();
+        return { ok: false, reason: `XML syntax error: ${msg}`, fixed: null };
+      }
+
+      const root = doc.documentElement;
+
+      /* ── Step 2: check for the required MusicXML root element ── */
+      /*
+       A complete MusicXML file must have either:
+         <score-partwise> ... </score-partwise>  (most common)
+         <score-timewise> ... </score-timewise>  (rare, time-major format)
+       If neither is present, the file is a fragment (e.g. an exported
+       <measure> or <part> snippet) that cannot stand alone.
+      */
+      const rootName = root.tagName.toLowerCase();
+
+      if (rootName === 'score-partwise' || rootName === 'score-timewise') {
+        /* Root is correct — check that at least one <measure> exists */
+        const measures = doc.querySelectorAll('measure');
+        if (measures.length === 0) {
+          return { ok: false, reason: 'MusicXML document has no <measure> elements — the score appears to be empty.', fixed: null };
+        }
+        return { ok: true };  // document looks valid
+      }
+
+      /*
+       ── Step 3: attempt to auto-repair a fragment ──
+       Common fragment types we can wrap into a minimal valid document:
+
+       A) Bare <measure> elements (or a single <measure>) — wrap in
+          <part> then <score-partwise>.
+       B) A bare <part> element — wrap in <score-partwise>.
+
+       We reconstruct the minimal scaffolding that OSMD needs:
+         <score-partwise>
+           <part-list>
+             <score-part id="P1"><part-name>Music</part-name></score-part>
+           </part-list>
+           <part id="P1"> ... measures ... </part>
+         </score-partwise>
+      */
+
+      let measuresToWrap = null;  // NodeList or null
+      let fragmentDesc   = '';
+
+      if (rootName === 'measure') {
+        /*
+         The root element itself is a <measure> — single measure fragment.
+         Collect it plus any siblings that are also <measure> elements.
+        */
+        measuresToWrap = [root];
+        fragmentDesc   = 'single <measure> fragment';
+
+      } else if (rootName === 'part') {
+        /*
+         The root element is a <part> — contains measures but lacks the
+         outer <score-partwise> and <part-list> scaffolding.
+        */
+        measuresToWrap = root.querySelectorAll('measure');
+        fragmentDesc   = '<part> fragment (missing <score-partwise> wrapper)';
+
+      } else {
+        /*
+         Unknown root element — we cannot safely infer what to do.
+         Report the root tag name so the user has a starting point.
+        */
+        return {
+          ok: false,
+          reason: `Unrecognised root element <${root.tagName}>. A MusicXML file must begin with <score-partwise> or <score-timewise>.`,
+          fixed: null
+        };
+      }
+
+      /* Serialise the measure nodes back to XML strings */
+      const serializer    = new XMLSerializer();
+      const measuresXml   = Array.from(measuresToWrap)
+        .map(m => serializer.serializeToString(m))
+        .join('\n      ');
+
+      /*
+       Build a minimal but complete score-partwise document.
+       We preserve the original measure content exactly; only the
+       outer scaffold is synthesised.
+      */
+      const fixed = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE score-partwise PUBLIC
+  "-//Recordare//DTD MusicXML 3.1 Partwise//EN"
+  "http://www.musicxml.org/dtds/partwise.dtd">
+<score-partwise version="3.1">
+  <part-list>
+    <score-part id="P1">
+      <part-name>Music</part-name>
+    </score-part>
+  </part-list>
+  <part id="P1">
+      ${measuresXml}
+  </part>
+</score-partwise>`;
+
+      return {
+        ok:     false,
+        reason: `File is a MusicXML fragment (${fragmentDesc}) rather than a complete score document.`,
+        fixed:  fixed   // caller will use this repaired XML
+      };
+    }
+
+    /*
+     ─────────────────────────────────────────────────────────────
+     LOAD MUSICXML (STRING)
+     Primary render path for plain-text MusicXML.
+     Now runs diagnoseMusicXML() first and either repairs the
+     file automatically or surfaces a clear error message.
+     ─────────────────────────────────────────────────────────────
+    */
+    async function loadMusicXML(xmlString, filename) {
+      showLoading(true);   // true = reset scroll position on new file load
+      setStatus('Parsing score…', 'ok');
+
+      /* ── Diagnose before passing to OSMD ── */
+      const diagnosis = diagnoseMusicXML(xmlString);
+
+      if (!diagnosis.ok) {
+        if (diagnosis.fixed) {
+          /*
+           We detected a fragment but were able to construct a valid
+           wrapper document. Inform the user and proceed with the
+           repaired XML — they don't need to do anything themselves.
+          */
+          setStatus(`Auto-repaired: ${diagnosis.reason}`, 'warn');
+          console.info('[ScoreViewer] Fragment detected — auto-repaired:\n', diagnosis.reason);
+          xmlString = diagnosis.fixed;   // substitute the repaired version
+        } else {
+          /*
+           Problem is fatal and we cannot repair it automatically.
+           Show the specific reason so the user knows what to fix.
+          */
+          setStatus(`Cannot load file — ${diagnosis.reason}`, 'error');
+          showEmpty();
+          return;
+        }
+      }
+
+      /* Cache the (possibly repaired) XML for re-rendering */
+      scoreXmlText = xmlString;
+
+      try {
+        if (!osmd) initOSMD();
+
+        /* Tell OSMD to load and parse the XML */
+        await osmd.load(xmlString);
+
+        onScoreLoaded(filename);
+
+      } catch (err) {
+        /*
+         OSMD threw despite passing our pre-flight check. Log the
+         full error for debugging and show a readable summary.
+        */
+        const summary = err.message || String(err);
+        setStatus(`Render error: ${summary}`, 'error');
+        console.error('[ScoreViewer] OSMD error:', err);
+        showEmpty();
+      }
+    }
+
+    /*
+     ─────────────────────────────────────────────────────────────
+     ON SCORE LOADED
+     Called after OSMD has successfully parsed the score.
+     Reads metadata, triggers first render, and enables controls.
+     ─────────────────────────────────────────────────────────────
+    */
+    async function onScoreLoaded(filename) {
+      setStatus('Rendering…', 'ok');
+
+      /*
+       Set page-based rendering mode first. OSMD's page format
+       determines how it lays out measures across pages.
+      */
+      applyPageFormat();
+
+      /* Render with the current zoom */
+      osmd.zoom = currentZoom;
+      await osmd.render();
+
+      /*
+       After render we can read pagination metadata.
+       OSMD exposes GraphicSheet.MusicPages — each page has a list of
+       systems, and each system has a list of MeasureList entries.
+      */
+      gatherScoreMetadata();
+
+      /* Update the UI now that we have measure/page counts */
+      currentPage = 1;
+      updatePageUI();
+
+      /* Reset per-score UI state on new load */
+      selectedPartIdx = -1;
+      showPartNames   = document.getElementById('toggle-part-names').checked;
+
+      /* Populate the instrument dropdown from the parsed sheet */
+      populateInstrumentSelector();
+
+      /* Apply part-name visibility (may have been toggled on a previous score) */
+      applyPartNameVisibility();
+
+      /* Show the score and enable control panels */
+      showScoreView();
+
+      /*
+       Reset the scroll position AFTER showScoreView() makes the container
+       visible. scrollIntoView (used by scrollToPage) has no effect on a
+       hidden element, so calling it before showScoreView() was silently
+       doing nothing — leaving the viewport wherever the previous score
+       had scrolled to. A direct scrollTop assignment is more reliable
+       here than scrollToPage() since we always want the very top.
+      */
+      resetScroll();
+      document.getElementById('controls-section').style.display = 'flex';
+      document.getElementById('zoom-section').style.display      = 'block';
+      document.getElementById('lilypond-notice').style.display   = 'none';
+      document.getElementById('btn-render-range').disabled        = false;
+
+      setStatus(`Loaded: ${filename}  |  ${totalMeasures} measures, ${totalPages} page(s)`, 'ok');
+    }
+
+    /*
+     ─────────────────────────────────────────────────────────────
+     GATHER SCORE METADATA
+     Extract total pages and total measures from OSMD's internal
+     data structures. These are needed for validation and UI labels.
+     ─────────────────────────────────────────────────────────────
+    */
+    function gatherScoreMetadata() {
+      /*
+       OSMD exposes the rendered sheet via osmd.GraphicSheet.
+       MusicPages is an array of GraphicalMusicPage objects.
+      */
+      const sheet = osmd.GraphicSheet;
+      totalPages = sheet ? (sheet.MusicPages ? sheet.MusicPages.length : 1) : 1;
+
+      const source   = osmd.Sheet;
+      const measures = source && source.SourceMeasures ? source.SourceMeasures : [];
+
+      /*
+       ── Anacrusis (pickup bar) detection ──────────────────────────
+       By convention, a pickup bar is unnumbered: the first *full* bar
+       is bar 1. MusicXML encodes this with implicit="yes" on the first
+       measure (and typically number="0"). OSMD stores this as
+       SourceMeasure.implicitMeasure === true.
+
+       OSMD's drawFromMeasureNumber / drawUpToMeasureNumber are physical
+       1-based indices into SourceMeasures[] — they are not musical bar
+       numbers. So when an anacrusis is present, user bar 1 must map to
+       OSMD index 2 (physical measure 2). We store anacrusisOffset = 1
+       and add it inside renderRange() before calling setOptions().
+
+       We also fall back to checking .measureNumber === 0, because some
+       notation software emits number="0" without the implicit attribute.
+      */
+      anacrusisOffset = 0;
+      if (measures.length > 0) {
+        const first = measures[0];
+        if (first.implicitMeasure === true || first.measureNumber === 0) {
+          anacrusisOffset = 1;
+        }
+      }
+
+      /*
+       totalMeasures is the count of full bars visible to the user.
+       We exclude the anacrusis so the hint and input max values match
+       the bar numbers printed in the score.
+      */
+      totalMeasures = measures.length - anacrusisOffset;
+
+      /*
+       minBar is the lowest bar number the user is allowed to enter.
+       When an anacrusis exists it is 0 (the pickup bar); otherwise 1.
+       We update the input's min attribute so the browser's built-in
+       spinner arrows also respect this floor.
+      */
+      minBar = anacrusisOffset ? 0 : 1;
+      document.getElementById('input-bar-from').min = minBar;
+
+      const hintEl = document.getElementById('total-measures-label');
+      hintEl.textContent = anacrusisOffset
+        ? totalMeasures + ' (plus a pickup bar — use bar 0 to include it)'
+        : totalMeasures;
+      document.getElementById('range-hint').style.display = 'block';
+
+      /* Default 'to' bar to 8 or total, whichever is smaller */
+      document.getElementById('input-bar-to').value   = Math.min(8, totalMeasures);
+      document.getElementById('input-bar-to').max     = totalMeasures;
+      document.getElementById('input-bar-from').max   = totalMeasures;
+      document.getElementById('input-goto-page').max  = totalPages;
+    }
+
+    /*
+     ─────────────────────────────────────────────────────────────
+     APPLY PAGE FORMAT
+     Switches OSMD between multi-page and endless-scroll layouts.
+     In PAGE mode we use OSMD's built-in page layout so each render
+     call produces a neatly paginated score. In RANGE mode we use
+     'Endless' so all selected measures flow as one long strip.
+     ─────────────────────────────────────────────────────────────
+    */
+    function applyPageFormat() {
+      if (!osmd) return;
+      if (currentMode === 'page') {
+        /*
+         'A4_P' = ISO A4 portrait. Other options: 'Letter_P', 'A3_P'.
+         This tells OSMD to wrap music to match the chosen paper size.
+
+         We do NOT attempt to clear drawFromMeasureNumber/drawUpToMeasureNumber
+         here via setOptions. OSMD's setOptions merges into its existing
+         EngravingRules object and may silently ignore falsy (0) values,
+         leaving the prior restriction in place. The range reset is handled
+         instead by reloading the score XML in rerenderPageMode(), which
+         gives OSMD a completely clean internal state.
+        */
+        osmd.setOptions({ pageFormat: 'A4_P', pageBackgroundColor: '#ffffff' });
+      } else {
+        /* Endless: no page breaks; everything flows vertically */
+        osmd.setOptions({ pageFormat: 'Endless', pageBackgroundColor: '#ffffff' });
+      }
+    }
+
+    /*
+     ─────────────────────────────────────────────────────────────
+     TAB SWITCHING
+     Swaps between PAGE and BAR RANGE modes.
+     ─────────────────────────────────────────────────────────────
+    */
+    function switchTab(mode) {
+      currentMode = mode;
+
+      /* Toggle tab button active states */
+      document.getElementById('tab-page').classList.toggle('active',  mode === 'page');
+      document.getElementById('tab-range').classList.toggle('active', mode === 'range');
+
+      /* Toggle panel visibility */
+      document.getElementById('panel-page').classList.toggle('active',  mode === 'page');
+      document.getElementById('panel-range').classList.toggle('active', mode === 'range');
+
+      if (mode === 'page' && osmd && scoreXmlText) {
+        /*
+         Switching back to page mode: re-render with page layout.
+         We need to re-apply the format and re-render.
+        */
+        rerenderPageMode();
+      }
+    }
+
+    /*
+     ─────────────────────────────────────────────────────────────
+     RE-RENDER PAGE MODE
+     Called when switching back to PAGE mode from RANGE mode.
+     ─────────────────────────────────────────────────────────────
+    */
+    async function rerenderPageMode() {
+      showLoading();
+
+      /*
+       To guarantee the full score renders with no bar-range restriction,
+       we destroy the existing OSMD instance and create a fresh one.
+
+       Previous attempts used osmd.load() to reset state, and setOptions()
+       with drawFromMeasureNumber:0 before that. Both failed because
+       drawFromMeasureNumber/drawUpToMeasureNumber appear to be stored
+       directly on the OSMD instance (or its EngravingRules) in a way
+       that survives load() and is not reliably cleared by setOptions()
+       with a falsy value. Recreating the instance from scratch is the
+       only approach that is guaranteed to produce a clean slate.
+
+       The osmd-canvas div is emptied first so the new instance has a
+       clean DOM target with no leftover SVG children from the previous
+       render.
+      */
+      const canvas = document.getElementById('osmd-canvas');
+      canvas.innerHTML = '';   // remove all SVG children from prior render
+      osmd = null;             // allow the old instance to be garbage collected
+      initOSMD();              // create a fresh instance with default options
+
+      /* Apply page format on the fresh instance before loading */
+      applyPageFormat();
+      applyPartNameVisibility();
+
+      /* Load and render the full score from the cached XML string */
+      await osmd.load(scoreXmlText);
+
+      /*
+       Re-apply instrument visibility. The fresh instance has all
+       instruments visible by default, so we only need to act if the
+       user had selected a specific part.
+      */
+      if (selectedPartIdx !== -1 && osmd.Sheet) {
+        osmd.Sheet.Instruments.forEach((instr, idx) => {
+          instr.Visible = (idx === selectedPartIdx);
+        });
+      }
+
+      osmd.zoom = currentZoom;
+      await osmd.render();
+      gatherScoreMetadata();
+      currentPage = 1;
+      updatePageUI();
+      showScoreView();           // must be visible before scrollToPage works
+      scrollToPage(currentPage);
+      setStatus(`Page mode  |  ${totalMeasures} measures, ${totalPages} page(s)`, 'ok');
+    }
+
+    /*
+     ─────────────────────────────────────────────────────────────
+     PAGE NAVIGATION
+     In OSMD's paginated SVG output, each page is a separate SVG
+     element. We scroll the container to the correct one.
+     ─────────────────────────────────────────────────────────────
+    */
+
+    /* Move forward (+1) or backward (-1) by one page */
+    function changePage(delta) {
+      const newPage = currentPage + delta;
+      if (newPage < 1 || newPage > totalPages) return;
+      currentPage = newPage;
+      updatePageUI();
+      scrollToPage(currentPage);
+    }
+
+    /* Jump to an arbitrary page */
+    function gotoPage() {
+      const val = parseInt(document.getElementById('input-goto-page').value, 10);
+      if (isNaN(val) || val < 1 || val > totalPages) return;
+      currentPage = val;
+      updatePageUI();
+      scrollToPage(currentPage);
+    }
+
+    /* Refresh the page indicator text and button disabled states */
+    function updatePageUI() {
+      document.getElementById('page-indicator').textContent =
+        `Page ${currentPage} / ${totalPages}`;
+      document.getElementById('btn-prev').disabled = (currentPage <= 1);
+      document.getElementById('btn-next').disabled = (currentPage >= totalPages);
+    }
+
+    /*
+     Scroll the viewport so the top of the target page is visible.
+     OSMD renders each page as an SVG with a data-page attribute
+     (1-indexed). We find the nth SVG child and use scrollIntoView.
+    */
+    function scrollToPage(pageNum) {
+      /*
+       behavior:'instant' makes this synchronous, so it cannot race with
+       resetScroll. smooth was removed because it is asynchronous and was
+       completing after resetScroll on new file loads, overwriting scrollTop.
+       That race condition is now also prevented by overflow-anchor:none on
+       #score-container, but instant is still preferable for correctness.
+      */
+      const svgs = document.querySelectorAll('#osmd-canvas svg');
+      if (svgs.length >= pageNum) {
+        svgs[pageNum - 1].scrollIntoView({ behavior: 'instant', block: 'start' });
+      }
+    }
+
+    /*
+     ─────────────────────────────────────────────────────────────
+     BAR RANGE RENDERING
+     Renders only a subset of measures using OSMD's
+     setOptions({ drawFromMeasureNumber, drawUpToMeasureNumber }).
+     ─────────────────────────────────────────────────────────────
+    */
+    async function renderRange() {
+      if (!osmd) return;
+
+      const from = parseInt(document.getElementById('input-bar-from').value, 10);
+      const to   = parseInt(document.getElementById('input-bar-to').value,   10);
+
+      /*
+       Validate the range.
+       minBar is 0 when an anacrusis is present (so bar 0 is the pickup),
+       or 1 otherwise. We use it as the lower bound for 'from'.
+       'to' must always be at least 'from' and at least bar 1 (we never
+       want 'to' to point exclusively at the pickup bar).
+      */
+      if (isNaN(from) || isNaN(to) || from < minBar || to < 1 || to < from) {
+        setStatus(
+          anacrusisOffset
+            ? 'Invalid bar range — "From" may be 0 (pickup) or 1–' + totalMeasures + '; "To" must be ≥ "From" and ≥ 1'
+            : 'Invalid bar range — "From" must be ≥ 1, "To" must be ≥ "From"',
+          'warn'
+        );
+        return;
+      }
+
+      if (totalMeasures > 0 && to > totalMeasures) {
+        setStatus(`Warning: score only has ${totalMeasures} measures`, 'warn');
+      }
+
+      showLoading();
+      applyPageFormat(); // ensure Endless layout for range mode
+
+      /*
+       ── Anacrusis offset ──────────────────────────────────────────
+       The user enters musical bar numbers (first full bar = 1).
+       OSMD's drawFromMeasureNumber / drawUpToMeasureNumber are physical
+       1-based indices into SourceMeasures[], counting from the very
+       first element including any anacrusis.
+
+       anacrusisOffset is 1 when the score opens with a pickup bar,
+       0 otherwise (set in gatherScoreMetadata). Adding it translates
+       user bar numbers into the physical indices OSMD expects.
+
+       Example: score with pickup bar
+         User enters bar 1 → OSMD index 2  (skip the pickup)
+         User enters bar 8 → OSMD index 9
+      */
+      osmd.setOptions({
+        drawFromMeasureNumber: from + anacrusisOffset,
+        drawUpToMeasureNumber: to   + anacrusisOffset,
+      });
+
+      osmd.zoom = currentZoom;
+
+      try {
+        await osmd.render();
+        showScoreView();
+        /* Scroll to the top of the rendered range */
+        resetScroll();
+        /* Label bar 0 as the pickup in the status bar so it is self-explanatory */
+        const fromLabel = (from === 0) ? 'pickup' : from;
+        setStatus(`Showing bars ${fromLabel}–${to}`, 'ok');
+      } catch (err) {
+        setStatus('Range render error: ' + err.message, 'error');
+        showEmpty();
+      }
+    }
+
+    /*
+     ─────────────────────────────────────────────────────────────
+     SHIFT RANGE
+     Advance or rewind the bar range window by its current size.
+     E.g. if bars 1–8 are shown, shiftRange(+1) → bars 9–16.
+     ─────────────────────────────────────────────────────────────
+    */
+    function shiftRange(direction) {
+      /*
+       Parse current values. Note that bar 0 (pickup) is a valid value
+       for 'from', so we cannot use `|| 1` as a fallback for NaN — that
+       would silently discard a legitimate zero. Use explicit NaN check.
+      */
+      const rawFrom = parseInt(document.getElementById('input-bar-from').value, 10);
+      const rawTo   = parseInt(document.getElementById('input-bar-to').value,   10);
+      const from    = isNaN(rawFrom) ? minBar : rawFrom;
+      const to      = isNaN(rawTo)   ? 8      : rawTo;
+      const chunkSize = to - from + 1;  // preserve the current window width
+
+      let newFrom = from + direction * chunkSize;
+      let newTo   = to   + direction * chunkSize;
+
+      /*
+       Clamp lower bound to minBar (0 if anacrusis present, else 1).
+       When clamping the lower end, preserve the chunk size from minBar.
+      */
+      if (newFrom < minBar) { newFrom = minBar; newTo = minBar + chunkSize - 1; }
+      if (totalMeasures > 0 && newTo > totalMeasures) {
+        newTo   = totalMeasures;
+        newFrom = Math.max(minBar, newTo - chunkSize + 1);
+      }
+
+      document.getElementById('input-bar-from').value = newFrom;
+      document.getElementById('input-bar-to').value   = newTo;
+
+      renderRange(); // auto-render after shifting
+    }
+
+    /*
+     ─────────────────────────────────────────────────────────────
+     ZOOM
+     Updates OSMD's zoom level and triggers a re-render.
+     We debounce slightly so rapid slider movement doesn't flood
+     the render queue.
+     ─────────────────────────────────────────────────────────────
+    */
+    let zoomTimer = null;
+
+    function updateZoom(value) {
+      currentZoom = parseFloat(value);
+      document.getElementById('zoom-label').textContent = currentZoom.toFixed(1) + '×';
+
+      /* Debounce: wait 300 ms after the last slider move before rendering */
+      clearTimeout(zoomTimer);
+      zoomTimer = setTimeout(async () => {
+        if (!osmd) return;
+        osmd.zoom = currentZoom;
+        showLoading();
+        await osmd.render();
+        if (currentMode === 'page') {
+          gatherScoreMetadata();
+          updatePageUI();
+          scrollToPage(currentPage);
+        }
+        showScoreView();
+        setStatus(`Zoom: ${currentZoom.toFixed(1)}×`, 'ok');
+      }, 300);
+    }
+
+    /*
+     ─────────────────────────────────────────────────────────────
+     POPULATE INSTRUMENT SELECTOR
+     Reads osmd.Sheet.Instruments after a successful load and fills
+     the dropdown in the Display panel. Only shown when the score
+     has more than one instrument.
+     ─────────────────────────────────────────────────────────────
+    */
+    function populateInstrumentSelector() {
+      const sel = document.getElementById('select-instrument');
+      const row = document.getElementById('instrument-select-row');
+
+      /* Clear previous entries, keeping only the 'All instruments' option */
+      while (sel.options.length > 1) sel.remove(1);
+
+      const instruments = osmd.Sheet && osmd.Sheet.Instruments
+        ? osmd.Sheet.Instruments : [];
+
+      if (instruments.length <= 1) {
+        /* Single-instrument score: hide the selector entirely */
+        row.style.display = 'none';
+        return;
+      }
+
+      /* Add one <option> per instrument, using its name from the score */
+      instruments.forEach((instr, idx) => {
+        const opt   = document.createElement('option');
+        opt.value   = idx;
+        /*
+         Instrument.Name comes from the MusicXML <part-name> element.
+         Fall back to a generic label if the score omits it.
+        */
+        opt.textContent = instr.Name || `Instrument ${idx + 1}`;
+        sel.appendChild(opt);
+      });
+
+      /* Reset the <select> to 'All instruments' */
+      sel.value = '-1';
+      row.style.display = 'flex';
+    }
+
+    /*
+     ─────────────────────────────────────────────────────────────
+     SELECT INSTRUMENT
+     Called when the instrument <select> changes. Sets .Visible on
+     each Instrument object, then re-renders.
+     ─────────────────────────────────────────────────────────────
+    */
+    async function selectInstrument(value) {
+      if (!osmd || !osmd.Sheet) return;
+
+      selectedPartIdx = parseInt(value, 10); // -1 = all, ≥0 = specific part
+
+      const instruments = osmd.Sheet.Instruments || [];
+
+      /*
+       OSMD respects the Instrument.Visible flag at render time.
+       Setting it to false hides the entire stave for that part.
+       We set all parts visible first, then hide the unwanted ones.
+      */
+      instruments.forEach((instr, idx) => {
+        instr.Visible = (selectedPartIdx === -1 || idx === selectedPartIdx);
+      });
+
+      showLoading();
+      applyPageFormat();
+      osmd.zoom = currentZoom;
+
+      try {
+        await osmd.render();
+
+        if (currentMode === 'page') {
+          gatherScoreMetadata();
+          updatePageUI();
+          scrollToPage(currentPage);
+        }
+
+        showScoreView();
+
+        const label = selectedPartIdx === -1
+          ? 'All instruments'
+          : (instruments[selectedPartIdx]
+              ? instruments[selectedPartIdx].Name || `Instrument ${selectedPartIdx + 1}`
+              : 'Unknown');
+        setStatus(`Showing: ${label}`, 'ok');
+
+      } catch (err) {
+        setStatus('Instrument filter error: ' + err.message, 'error');
+        showScoreView();
+      }
+    }
+
+    /*
+     ─────────────────────────────────────────────────────────────
+     TOGGLE PART NAMES
+     Called by the 'Show stave names' checkbox. Updates the flag
+     and triggers a re-render. drawPartNames is an OSMD option that
+     suppresses the text label printed to the left of each system.
+     drawPartAbbreviations follows the same switch so the abbreviated
+     names shown on continuation systems are also suppressed.
+     ─────────────────────────────────────────────────────────────
+    */
+    async function togglePartNames(checked) {
+      showPartNames = checked;
+      applyPartNameVisibility();
+
+      showLoading();
+      osmd.zoom = currentZoom;
+
+      try {
+        await osmd.render();
+
+        if (currentMode === 'page') {
+          gatherScoreMetadata();
+          updatePageUI();
+          scrollToPage(currentPage);
+        }
+
+        showScoreView();
+        setStatus(showPartNames ? 'Stave names shown' : 'Stave names hidden', 'ok');
+
+      } catch (err) {
+        setStatus('Display error: ' + err.message, 'error');
+        showScoreView();
+      }
+    }
+
+    /*
+     ─────────────────────────────────────────────────────────────
+     APPLY PART NAME VISIBILITY
+     Centralised helper so initOSMD, onScoreLoaded, and
+     togglePartNames all set the option in one place.
+     ─────────────────────────────────────────────────────────────
+    */
+    function applyPartNameVisibility() {
+      if (!osmd) return;
+      osmd.setOptions({
+        drawPartNames:             showPartNames,
+        drawPartAbbreviations:     showPartNames,
+      });
+    }
+
+    /*
+     ─────────────────────────────────────────────────────────────
+     KEYBOARD SHORTCUTS
+     Arrow keys navigate pages; Enter triggers range render.
+     ─────────────────────────────────────────────────────────────
+    */
+    document.addEventListener('keydown', (e) => {
+      /* Don't interfere when the user is typing in an input */
+      if (e.target.tagName === 'INPUT') return;
+
+      if (currentMode === 'page') {
+        if (e.key === 'ArrowRight' || e.key === 'ArrowDown')  changePage(+1);
+        if (e.key === 'ArrowLeft'  || e.key === 'ArrowUp')    changePage(-1);
+      }
+    });
+
+    /*
+     ─────────────────────────────────────────────────────────────
+     INITIALISE ON LOAD
+     ─────────────────────────────────────────────────────────────
+    */
+    /*
+     ─────────────────────────────────────────────────────────────
+     WINDOW RESIZE HANDLER
+     Now that autoResize is disabled on the OSMD instance, we
+     handle window resize ourselves with a debounce so rapid
+     drag-resizing doesn't queue many re-renders.
+     ─────────────────────────────────────────────────────────────
+    */
+    let resizeTimer = null;
+    window.addEventListener('resize', () => {
+      if (!osmd || !scoreXmlText) return;   // no score loaded yet
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(async () => {
+        osmd.zoom = currentZoom;
+        try {
+          await osmd.render();
+          if (currentMode === 'page') {
+            gatherScoreMetadata();
+            updatePageUI();
+          }
+        } catch (e) { /* ignore resize render errors */ }
+      }, 250);  // wait 250 ms after the last resize event
+    });
+
+    window.addEventListener('DOMContentLoaded', () => {
+      setStatus('Ready — drop or open a MusicXML file', 'ok');
+    });
+
+  </script>
+</body>
+</html>
